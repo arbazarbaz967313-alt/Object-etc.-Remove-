@@ -659,38 +659,42 @@ function sat(px,i){
   return mx>10?(mx-mn)/mx:0;
 }
 
-/* ── Watermark: semi-transparent bright overlay in one region ── */
+/* ── Watermark: looks for bright/white semi-transparent text overlays
+      Strategy: scan entire image but EXCLUDE the center 50% zone
+      (main subject is always center; watermarks are edges/bottom/top) ── */
 function detectWM(px,W,H){
-  /* Score each pixel: bright AND low-saturation AND repeating pattern */
-  var GS=6,GW=Math.floor(W/GS),GH=Math.floor(H/GS);
+  var GS=8,GW=Math.floor(W/GS),GH=Math.floor(H/GS);
   var sc=new Float32Array(GW*GH);
+
+  /* Center exclusion zone — avoid selecting main subject */
+  var cx1=Math.floor(GW*0.25),cx2=Math.floor(GW*0.75);
+  var cy1=Math.floor(GH*0.20),cy2=Math.floor(GH*0.75);
+
   for(var gy=0;gy<GH;gy++){
     for(var gx=0;gx<GW;gx++){
+      /* If inside center zone, give it 0 score */
+      if(gx>=cx1&&gx<=cx2&&gy>=cy1&&gy<=cy2){sc[gy*GW+gx]=0;continue;}
       var wmScore=0,cnt=0;
       for(var dy=0;dy<GS;dy++){
         for(var dx=0;dx<GS;dx++){
           var ix=((gy*GS+dy)*W+(gx*GS+dx))*4;
           if(ix+3>=px.length)continue;
           var l=lum(px,ix),s=sat(px,ix);
-          /* Watermarks are: bright (>160) OR very light grey, low saturation */
-          if(l>155&&s<0.30)wmScore+=1;
-          /* Also catch semi-transparent: medium bright + very low sat */
-          else if(l>100&&l<200&&s<0.15)wmScore+=0.5;
+          if(l>170&&s<0.25)wmScore+=1;        /* bright white text */
+          else if(l>120&&s<0.12)wmScore+=0.6; /* light grey watermark */
           cnt++;
         }
       }
       sc[gy*GW+gx]=cnt?wmScore/cnt:0;
     }
   }
-  /* Filter out large blobs (likely main image content) — keep only small clusters */
-  var blobs=blobEx(sc,GW,GH,GS,0.35);
-  var maxArea=W*H*0.25; /* ignore if >25% of image */
+  var blobs=blobEx(sc,GW,GH,GS,0.32);
+  var maxArea=W*H*0.20;
   return blobs.filter(function(b){return b.area<maxArea;}).slice(0,4);
 }
 
-/* ── Text/Caption: horizontal bands with high contrast edges, NOT full-height ── */
+/* ── Text/Caption: horizontal text bands — focus on bottom/top 40% of image ── */
 function detectTxt(px,W,H){
-  /* Step 1: compute per-pixel edge magnitude */
   var edge=new Float32Array(W*H);
   for(var y=1;y<H-1;y++){
     for(var x=1;x<W-1;x++){
@@ -703,48 +707,49 @@ function detectTxt(px,W,H){
     }
   }
 
-  /* Step 2: row-based approach — text appears as horizontal lines */
   var GS=6,GW=Math.floor(W/GS),GH=Math.floor(H/GS);
   var sc=new Float32Array(GW*GH);
+
+  /* Text usually in bottom 40% or top 15% — exclude center-vertical */
+  var midTop=Math.floor(GH*0.15);
+  var midBot=Math.floor(GH*0.60);
+
   for(var gy=0;gy<GH;gy++){
     for(var gx=0;gx<GW;gx++){
-      var eSum=0,cnt=0,darkOnLight=0;
+      /* Weight: higher for edges of image */
+      var zoneBoost=(gy<midTop||gy>midBot)?1.0:0.4;
+      var eSum=0,cnt=0,charPx=0;
       for(var dy=0;dy<GS;dy++){
         for(var dx=0;dx<GS;dx++){
           var py2=gy*GS+dy,px2=gx*GS+dx;
           var pi=py2*W+px2;
           if(pi>=edge.length)continue;
           eSum+=edge[pi];
-          /* Text chars: dark pixel surrounded by light OR light on dark */
           var ii=pi*4;
           if(ii+3<px.length){
             var l=lum(px,ii);
-            if(l<60)darkOnLight+=1;   /* dark text */
-            else if(l>200)darkOnLight+=0.8; /* light/white text */
+            if(l<50||l>210)charPx+=1;
           }
           cnt++;
         }
       }
-      /* High edge density + presence of dark/light pixels = text */
-      var edgeScore=cnt?(eSum/cnt)/120:0;
-      var charScore=cnt?darkOnLight/cnt:0;
-      sc[gy*GW+gx]=Math.min(1,(edgeScore*0.5+charScore*0.5));
+      var edgeScore=cnt?(eSum/cnt)/100:0;
+      var charScore=cnt?charPx/cnt:0;
+      sc[gy*GW+gx]=Math.min(1,(edgeScore*0.5+charScore*0.6))*zoneBoost;
     }
   }
 
-  var blobs=blobEx(sc,GW,GH,GS,0.22);
-  /* Text blobs: wide (width > height*1.5) and not too large */
-  var maxArea=W*H*0.30;
-  var good=blobs.filter(function(b){
-    return b.area<maxArea && b.w>GS*2;
-  });
-  return good.slice(0,5);
+  var blobs=blobEx(sc,GW,GH,GS,0.28);
+  var maxArea=W*H*0.25;
+  return blobs.filter(function(b){return b.area<maxArea&&b.w>GS*3;}).slice(0,4);
 }
 
-/* ── Logo: compact high-saturation cluster, small area ── */
+/* ── Logo: compact high-saturation cluster, prefer corners ── */
 function detectLogo(px,W,H){
   var GS=8,GW=Math.floor(W/GS),GH=Math.floor(H/GS);
   var sc=new Float32Array(GW*GH);
+  /* Corner bias — logos usually in corners */
+  var cx=GW/2,cy=GH/2;
   for(var gy=0;gy<GH;gy++){
     for(var gx=0;gx<GW;gx++){
       var satSum=0,cnt=0;
@@ -755,29 +760,24 @@ function detectLogo(px,W,H){
           satSum+=sat(px,ix);cnt++;
         }
       }
-      sc[gy*GW+gx]=cnt?satSum/cnt:0;
+      /* Distance from corners — closer to corner = higher boost */
+      var distFromCenter=Math.sqrt(Math.pow((gx-cx)/cx,2)+Math.pow((gy-cy)/cy,2));
+      var cornerBoost=Math.min(1.5,distFromCenter); /* max 1.5x near corners */
+      sc[gy*GW+gx]=cnt?(satSum/cnt)*cornerBoost:0;
     }
   }
-  var blobs=blobEx(sc,GW,GH,GS,0.32);
-  /* Logos: small and compact */
-  var maxArea=W*H*0.15;
+  var blobs=blobEx(sc,GW,GH,GS,0.30);
+  var maxArea=W*H*0.12;
   return blobs.filter(function(b){return b.area<maxArea;}).slice(0,2);
 }
 
 /* ── Object/Person: largest foreground blob vs background ── */
 function detectObj(px,W,H){
-  /* Sample background from edges of image (not just corners) */
   var bgSamples=[];
-  var step=Math.floor(W/20);
-  for(var x=0;x<W;x+=step){
-    bgSamples.push(x*4); /* top row */
-    bgSamples.push(((H-1)*W+x)*4); /* bottom row */
-  }
-  step=Math.floor(H/20);
-  for(var y2=0;y2<H;y2+=step){
-    bgSamples.push((y2*W)*4); /* left col */
-    bgSamples.push((y2*W+(W-1))*4); /* right col */
-  }
+  var step=Math.floor(W/20)||1;
+  for(var x=0;x<W;x+=step){bgSamples.push(x*4);bgSamples.push(((H-1)*W+x)*4);}
+  step=Math.floor(H/20)||1;
+  for(var y2=0;y2<H;y2+=step){bgSamples.push((y2*W)*4);bgSamples.push((y2*W+(W-1))*4);}
   var bgR=0,bgG=0,bgB=0,bn=0;
   for(var s=0;s<bgSamples.length;s++){
     var bi=bgSamples[s];
@@ -801,7 +801,6 @@ function detectObj(px,W,H){
       sc[gy*GW+gx]=cnt?Math.min(1,(diff/cnt)/50):0;
     }
   }
-  /* Return top 2 largest blobs */
   return blobEx(sc,GW,GH,GS,0.38).slice(0,2);
 }
 
@@ -879,10 +878,8 @@ function doRemove(){
       cv.cvtColor(mm,gm,cv.COLOR_RGBA2GRAY);
       cv.threshold(gm,bm,20,255,cv.THRESH_BINARY);
 
-      /* Radius: proportional to mask size, cap at 25 */
-      var maskArea=bm.countNonZero?bm.countNonZero():1;
-      var rad=Math.min(25,Math.max(5,Math.round(Math.sqrt(maskArea)*0.04)));
-
+      /* Fixed inpaint radius — safe default */
+      var rad=15;
       cv.inpaint(src,bm,dst,rad,cv.INPAINT_TELEA);
 
       /* ── If downscaled, upscale result back ── */
