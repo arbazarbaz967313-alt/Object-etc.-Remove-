@@ -188,12 +188,12 @@ body{background:var(--bg);color:var(--txt);font-family:'Space Grotesk',sans-seri
   position:relative;min-height:0;
 }
 #dc{
-  /* PicsArt style: fill the space as much as possible */
-  max-width:100%;max-height:100%;
-  width:100%;height:100%;
-  object-fit:contain;
+  /* NO object-fit — we size it explicitly via JS to avoid offset bugs */
   display:block;
   touch-action:none;
+  /* max constraints so it never overflows */
+  max-width:100%;
+  max-height:100%;
 }
 
 #proc-ov{
@@ -470,9 +470,9 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;heigh
       <!-- AI Button — shown for AI modes -->
       <div id="ai-section">
         <button class="ai-run-btn" id="ai-run-btn" onclick="runAI()">
-          🤖 AI Auto-Detect & Select
+          🔍 Smart Auto-Detect & Select
         </button>
-        <div style="font-size:10px;color:var(--mut);text-align:center;margin-top:4px">Claude AI · No API key needed</div>
+        <div style="font-size:10px;color:var(--mut);text-align:center;margin-top:4px">Local AI · No internet · 100% Private</div>
       </div>
 
       <div class="sep"><div class="sep-label">ya manually brush karo</div></div>
@@ -613,10 +613,11 @@ function loadF(file){
     oImg=img;iW=img.naturalWidth;iH=img.naturalHeight;
     document.getElementById('isz').textContent=`${iW}×${iH}`;
 
-    // Set canvas to image natural size
+    // Set canvas internal size = image natural size
     dc.width=iW;dc.height=iH;
-    // CSS: let canvas fill the area but maintain aspect ratio
-    dc.style.width='';dc.style.height='';
+
+    // Size canvas CSS to fit the canvas-area while keeping aspect ratio
+    fitCanvas();
 
     dCtx.clearRect(0,0,iW,iH);
     dCtx.drawImage(img,0,0);
@@ -652,6 +653,17 @@ function loadF(file){
   img.src=url;
 }
 
+function fitCanvas(){
+  if(!iW||!iH)return;
+  const area=document.getElementById('canvas-area');
+  const aW=area.clientWidth;
+  const aH=area.clientHeight;
+  const scale=Math.min(aW/iW,aH/iH,1); // never upscale beyond natural
+  dc.style.width=Math.round(iW*scale)+'px';
+  dc.style.height=Math.round(iH*scale)+'px';
+}
+window.addEventListener('resize',fitCanvas);
+
 // ── TOOLS ──
 function setT(t){
   tool=t;
@@ -672,18 +684,41 @@ function uC(){
   dc.style.cursor=`url("data:image/svg+xml,${encodeURIComponent(svg)}") ${c} ${c}, crosshair`;
 }
 
-// ── CANVAS COORDS ── (works for any display size)
+// ── CANVAS COORDS ── FIXED: accounts for object-fit:contain letterboxing
 function toI(e){
   const r=dc.getBoundingClientRect();
-  const scaleX=iW/r.width;
-  const scaleY=iH/r.height;
-  const cx=(e.touches?e.touches[0].clientX:e.clientX)-r.left;
-  const cy=(e.touches?e.touches[0].clientY:e.clientY)-r.top;
-  return[cx*scaleX,cy*scaleY];
+  // Canvas element display size
+  const dispW=r.width;
+  const dispH=r.height;
+  // Actual rendered image size inside canvas (object-fit:contain adds black bars)
+  const imgAspect=iW/iH;
+  const dispAspect=dispW/dispH;
+  let renderW,renderH,offsetX,offsetY;
+  if(imgAspect>dispAspect){
+    // Letterbox top/bottom
+    renderW=dispW;
+    renderH=dispW/imgAspect;
+    offsetX=0;
+    offsetY=(dispH-renderH)/2;
+  }else{
+    // Pillarbox left/right
+    renderH=dispH;
+    renderW=dispH*imgAspect;
+    offsetX=(dispW-renderW)/2;
+    offsetY=0;
+  }
+  const clientX=e.touches?e.touches[0].clientX:e.clientX;
+  const clientY=e.touches?e.touches[0].clientY:e.clientY;
+  const cx=clientX-r.left-offsetX;
+  const cy=clientY-r.top-offsetY;
+  // Clamp within image area
+  const ix=Math.max(0,Math.min(iW,cx*(iW/renderW)));
+  const iy=Math.max(0,Math.min(iH,cy*(iH/renderH)));
+  return[ix,iy];
 }
 function oD(e){if(!oImg)return;e.preventDefault();saveU();drw=true;const[x,y]=toI(e);lx=x;ly=y;pDot(x,y)}
 function oM(e){if(!drw)return;e.preventDefault();const[x,y]=toI(e);pLine(lx,ly,x,y);lx=x;ly=y}
-function oU(){drw=false}
+function oU(){drw=false;lastX=null;lastY=null}
 
 function redraw(){
   dCtx.clearRect(0,0,iW,iH);
@@ -747,69 +782,176 @@ function undo(){
 }
 document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key==='z')undo()});
 
-// ── AI ──
+// ── SMART LOCAL AI — No API key, uses color analysis + region detection ──
 async function runAI(){
   const cfg=MODES[currentMode];
   if(!cfg.aiPrompt){toast('Manual mode me brush use karo!','warn');return}
   if(!oImg){toast('Pehle image load karo!','warn');return}
+  if(!cvR){toast('OpenCV abhi load ho raha hai, thodi der mein try karo','warn');return}
   const btn=document.getElementById('ai-run-btn');
   btn.disabled=true;
-  toast(`🤖 ${cfg.name} detect ho raha hai...`,'info');
+  toast(`🔍 ${cfg.name} detect ho raha hai...`,'info');
+  setPS('Analyzing image...');
+  await slp(30);
   try{
-    const mx=800,sc=Math.min(1,mx/Math.max(iW,iH));
-    const tw=Math.round(iW*sc),th=Math.round(iH*sc);
-    const tc=document.createElement('canvas');
-    tc.width=tw;tc.height=th;
-    tc.getContext('2d').drawImage(oImg,0,0,tw,th);
-    const b64=tc.toDataURL('image/jpeg',.8).split(',')[1];
-    const res=await fetch('https://api.anthropic.com/v1/messages',{
-      method:'POST',
-      headers:{
-        'Content-Type':'application/json',
-        'anthropic-version':'2023-06-01',
-        'anthropic-dangerous-direct-browser-access':'true',
-      },
-      body:JSON.stringify({
-        model:'claude-sonnet-4-20250514',
-        max_tokens:500,
-        messages:[{role:'user',content:[
-          {type:'image',source:{type:'base64',media_type:'image/jpeg',data:b64}},
-          {type:'text',text:`Find the ${cfg.aiPrompt}. Return ONLY valid JSON, no markdown, no explanation: {"found":true,"items":[{"label":"desc","x":0-100,"y":0-100,"w":5-100,"h":5-100}]} where x,y,w,h are percentages of image. If not found: {"found":false,"items":[]}`}
-        ]}],
-      }),
-    });
-    if(!res.ok){
-      const err=await res.json().catch(()=>({}));
-      throw new Error(err?.error?.message||`HTTP ${res.status}`);
+    // Get pixel data
+    const tmpC=document.createElement('canvas');
+    const scale=Math.min(1,800/Math.max(iW,iH));
+    const tw=Math.round(iW*scale),th=Math.round(iH*scale);
+    tmpC.width=tw;tmpC.height=th;
+    const tmpCtx=tmpC.getContext('2d');
+    tmpCtx.drawImage(oImg,0,0,tw,th);
+    const imgData=tmpCtx.getImageData(0,0,tw,th);
+    const px=imgData.data;
+
+    let regions=[];
+    if(currentMode==='watermark'){
+      // Watermarks: semi-transparent, near-white/grey pixels in clusters
+      regions=detectByTransparencyAndColor(px,tw,th,'watermark');
+    }else if(currentMode==='logo'){
+      regions=detectByEdgeDensity(px,tw,th,'logo');
+    }else if(currentMode==='text'){
+      regions=detectByEdgeDensity(px,tw,th,'text');
+    }else if(currentMode==='object'){
+      // Object: largest distinct color region
+      regions=detectLargestSubject(px,tw,th);
     }
-    const data=await res.json();
-    if(data.error)throw new Error(data.error.message||'API error');
-    const rawText=data.content?.find(b=>b.type==='text')?.text||'';
-    if(!rawText)throw new Error('AI se response nahi aaya');
-    const cleaned=rawText.replace(/```json|```/g,'').trim();
-    const json=JSON.parse(cleaned);
-    if(!json.found||!json.items?.length){
-      toast(`Koi ${cfg.name} nahi mili — brush se try karo`,'warn');
-    }else{
-      saveU();
-      const mc=mCv.getContext('2d');
-      mc.fillStyle='white';
-      json.items.forEach(({x,y,w,h,label})=>{
-        const p=16;
-        mc.fillRect((x/100)*iW-p,(y/100)*iH-p,(w/100)*iW+p*2,(h/100)*iH+p*2);
-        toast(`✅ Mili: "${label}" — Remove dabao!`,'success');
-      });
-      redraw();setMS(true);
+
+    if(!regions||!regions.length){
+      toast(`${cfg.name} nahi mili. Brush se manually paint karo.`,'warn');
+      btn.disabled=false;setPS('Done!');return;
     }
+
+    saveU();
+    const mc=mCv.getContext('2d');
+    mc.fillStyle='white';
+    for(const reg of regions){
+      // Scale back from thumbnail coords to full image
+      const fx=Math.round(reg.x/scale);
+      const fy=Math.round(reg.y/scale);
+      const fw=Math.round(reg.w/scale);
+      const fh=Math.round(reg.h/scale);
+      const pad=Math.round(18/scale);
+      mc.fillRect(Math.max(0,fx-pad),Math.max(0,fy-pad),Math.min(iW,fw+pad*2),Math.min(iH,fh+pad*2));
+    }
+    redraw();setMS(true);
+    toast(`✅ ${regions.length} area mila! Remove dabao.`,'success');
   }catch(err){
     console.error(err);
-    if(err.message&&(err.message.includes('api-key')||err.message.includes('authentication')||err.message.includes('401'))){
-      toast('⚠️ AI sirf Claude.ai me kaam karta hai — brush use karo','warn');
-    }else{
-      toast(`❌ ${err.message||'Unknown error'}`,'error');
+    toast(`❌ ${err.message||'Detection failed'}. Brush use karo.`,'error');
+  }
+  btn.disabled=false;setPS('Done!');
+}
+
+// ── Detection helpers ──
+
+function detectByTransparencyAndColor(px,W,H,type){
+  // Scan for bright/grey semi-transparent looking patches
+  // (In screenshots, watermarks = light colored text on darker bg)
+  const grid=8;const gW=Math.ceil(W/grid);const gH=Math.ceil(H/grid);
+  const scores=new Float32Array(gW*gH);
+  for(let gy=0;gy<gH;gy++){
+    for(let gx=0;gx<gW;gx++){
+      let bright=0,cnt=0;
+      for(let dy=0;dy<grid;dy++){
+        for(let dx=0;dx<grid;dx++){
+          const px2=(((gy*grid+dy)*W)+(gx*grid+dx))*4;
+          if(px2>=px.length)continue;
+          const r=px[px2],g=px[px2+1],b=px[px2+2];
+          const lum=(r+g+b)/3;
+          // Watermarks tend to be: high brightness OR very uniform gray
+          const isGray=Math.max(r,g,b)-Math.min(r,g,b)<40;
+          if((lum>160)||(isGray&&lum>100)){bright++;} cnt++;
+        }
+      }
+      scores[gy*gW+gx]=cnt>0?bright/cnt:0;
     }
   }
-  btn.disabled=false;
+  return findHighScoreRegions(scores,gW,gH,grid,0.45,W,H,type);
+}
+
+function detectByEdgeDensity(px,W,H,type){
+  // Edge detection: high edge density = text/logo
+  const edges=new Float32Array(W*H);
+  for(let y=1;y<H-1;y++){
+    for(let x=1;x<W-1;x++){
+      const i=(y*W+x)*4;
+      const lum=(px[i]+px[i+1]+px[i+2])/3;
+      const lumR=(px[i+4]+px[i+5]+px[i+6])/3;
+      const lumD=(px[(y+1)*W*4+x*4]+px[(y+1)*W*4+x*4+1]+px[(y+1)*W*4+x*4+2])/3;
+      edges[y*W+x]=Math.abs(lum-lumR)+Math.abs(lum-lumD);
+    }
+  }
+  const grid=8;const gW=Math.ceil(W/grid);const gH=Math.ceil(H/grid);
+  const scores=new Float32Array(gW*gH);
+  for(let gy=0;gy<gH;gy++){
+    for(let gx=0;gx<gW;gx++){
+      let sum=0,cnt=0;
+      for(let dy=0;dy<grid;dy++)for(let dx=0;dx<grid;dx++){
+        const pi=(gy*grid+dy)*W+(gx*grid+dx);
+        if(pi<edges.length){sum+=edges[pi];cnt++;}
+      }
+      scores[gy*gW+gx]=cnt>0?(sum/cnt)/255:0;
+    }
+  }
+  const thresh=type==='text'?0.12:0.08;
+  return findHighScoreRegions(scores,gW,gH,grid,thresh,W,H,type);
+}
+
+function detectLargestSubject(px,W,H){
+  // Find center region of interest (main subject usually center)
+  const cx=Math.round(W/2),cy=Math.round(H/2);
+  // Sample center color
+  const ci=(cy*W+cx)*4;
+  const cr=px[ci],cg=px[ci+1],cb=px[ci+2];
+  // Mark pixels similar to center as foreground
+  const grid=12;const gW=Math.ceil(W/grid);const gH=Math.ceil(H/grid);
+  const scores=new Float32Array(gW*gH);
+  for(let gy=0;gy<gH;gy++){
+    for(let gx=0;gx<gW;gx++){
+      let match=0,cnt=0;
+      for(let dy=0;dy<grid;dy++)for(let dx=0;dx<grid;dx++){
+        const pi=((gy*grid+dy)*W+(gx*grid+dx))*4;
+        if(pi>=px.length)continue;
+        const dr=Math.abs(px[pi]-cr),dg=Math.abs(px[pi+1]-cg),db=Math.abs(px[pi+2]-cb);
+        if(dr+dg+db<120)match++;cnt++;
+      }
+      scores[gy*gW+gx]=cnt>0?match/cnt:0;
+    }
+  }
+  return findHighScoreRegions(scores,gW,gH,grid,0.4,W,H,'object');
+}
+
+function findHighScoreRegions(scores,gW,gH,grid,thresh,W,H,type){
+  // Group high-score cells into bounding boxes
+  const visited=new Uint8Array(gW*gH);
+  const regions=[];
+  for(let i=0;i<scores.length;i++){
+    if(scores[i]<thresh||visited[i])continue;
+    // BFS
+    const queue=[i];visited[i]=1;
+    let minX=i%gW,maxX=i%gW,minY=Math.floor(i/gW),maxY=Math.floor(i/gW);
+    while(queue.length){
+      const cur=queue.shift();
+      const cx2=cur%gW,cy2=Math.floor(cur/gW);
+      if(cx2<minX)minX=cx2;if(cx2>maxX)maxX=cx2;
+      if(cy2<minY)minY=cy2;if(cy2>maxY)maxY=cy2;
+      [[0,1],[0,-1],[1,0],[-1,0]].forEach(([dx,dy])=>{
+        const nx=cx2+dx,ny=cy2+dy;
+        if(nx<0||nx>=gW||ny<0||ny>=gH)return;
+        const ni=ny*gW+nx;
+        if(!visited[ni]&&scores[ni]>thresh*0.7){visited[ni]=1;queue.push(ni);}
+      });
+    }
+    const rx=minX*grid,ry=minY*grid;
+    const rw=(maxX-minX+1)*grid,rh=(maxY-minY+1)*grid;
+    // Filter: min size
+    if(rw<grid*2||rh<grid)continue;
+    regions.push({x:rx,y:ry,w:rw,h:rh});
+  }
+  // Sort by size, return top 3
+  regions.sort((a,b)=>b.w*b.h-a.w*a.h);
+  return regions.slice(0,3);
 }
 
 // ── REMOVE ──
