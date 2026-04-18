@@ -592,8 +592,7 @@ function setSz(s){
 }
 
 /* ══════════════════════════════════════════
-   SMART AUTO-DETECT
-   100% browser, no API, pixel analysis only
+   SMART AUTO-DETECT — v2 (precise detection)
 ══════════════════════════════════════════ */
 function runAI(){
   if(!origImg){toast('Pehle image load karo!','w');return;}
@@ -604,13 +603,15 @@ function runAI(){
     },400);
     setTimeout(function(){clearInterval(waitAI);},15000);
     return;
-  }  var btn=document.getElementById('ai-btn');
+  }
+  var btn=document.getElementById('ai-btn');
   btn.disabled=true;
   toast('🔍 Detect ho raha hai...','i');
 
   setTimeout(function(){
     try{
-      var SC=Math.min(1,600/Math.max(iW,iH));
+      /* Work at max 800px for speed */
+      var SC=Math.min(1,800/Math.max(iW,iH));
       var W2=Math.round(iW*SC),H2=Math.round(iH*SC);
       var tmp=document.createElement('canvas');
       tmp.width=W2;tmp.height=H2;
@@ -631,13 +632,15 @@ function runAI(){
       saveUndo();
       var mc=maskCv.getContext('2d');
       mc.fillStyle='white';
+      var PAD=Math.round(8/SC); /* small padding only */
       for(var k=0;k<boxes.length;k++){
         var b=boxes[k];
-        var x=Math.round(b.x/SC)-20;
-        var y=Math.round(b.y/SC)-20;
-        var w=Math.round(b.w/SC)+40;
-        var h=Math.round(b.h/SC)+40;
-        mc.fillRect(Math.max(0,x),Math.max(0,y),Math.min(iW-Math.max(0,x),w),Math.min(iH-Math.max(0,y),h));
+        var x=Math.round(b.x/SC)-PAD;
+        var y=Math.round(b.y/SC)-PAD;
+        var w=Math.round(b.w/SC)+PAD*2;
+        var h=Math.round(b.h/SC)+PAD*2;
+        mc.fillRect(Math.max(0,x),Math.max(0,y),
+          Math.min(iW-Math.max(0,x),w),Math.min(iH-Math.max(0,y),h));
       }
       redraw();setMS(true);
       toast('✅ '+boxes.length+' area select hua! Remove dabao','s');
@@ -649,61 +652,98 @@ function runAI(){
   },40);
 }
 
-/* Watermark: bright+low saturation clusters */
+/* ── HELPER: luminance ── */
+function lum(px,i){return(px[i]*299+px[i+1]*587+px[i+2]*114)/1000;}
+function sat(px,i){
+  var mx=Math.max(px[i],px[i+1],px[i+2]),mn=Math.min(px[i],px[i+1],px[i+2]);
+  return mx>10?(mx-mn)/mx:0;
+}
+
+/* ── Watermark: semi-transparent bright overlay in one region ── */
 function detectWM(px,W,H){
-  var GS=10,GW=Math.floor(W/GS),GH=Math.floor(H/GS);
+  /* Score each pixel: bright AND low-saturation AND repeating pattern */
+  var GS=6,GW=Math.floor(W/GS),GH=Math.floor(H/GS);
   var sc=new Float32Array(GW*GH);
   for(var gy=0;gy<GH;gy++){
     for(var gx=0;gx<GW;gx++){
-      var bright=0,cnt=0;
+      var wmScore=0,cnt=0;
       for(var dy=0;dy<GS;dy++){
         for(var dx=0;dx<GS;dx++){
           var ix=((gy*GS+dy)*W+(gx*GS+dx))*4;
           if(ix+3>=px.length)continue;
-          var r=px[ix],g=px[ix+1],b=px[ix+2];
-          var lum=(r*299+g*587+b*114)/1000;
-          var mx=Math.max(r,g,b),mn=Math.min(r,g,b);
-          var sat=mx>10?(mx-mn)/mx:0;
-          if(lum>140&&sat<0.35)bright++;
+          var l=lum(px,ix),s=sat(px,ix);
+          /* Watermarks are: bright (>160) OR very light grey, low saturation */
+          if(l>155&&s<0.30)wmScore+=1;
+          /* Also catch semi-transparent: medium bright + very low sat */
+          else if(l>100&&l<200&&s<0.15)wmScore+=0.5;
           cnt++;
         }
       }
-      sc[gy*GW+gx]=cnt?bright/cnt:0;
+      sc[gy*GW+gx]=cnt?wmScore/cnt:0;
     }
   }
-  return blobEx(sc,GW,GH,GS,0.38).slice(0,3);
+  /* Filter out large blobs (likely main image content) — keep only small clusters */
+  var blobs=blobEx(sc,GW,GH,GS,0.35);
+  var maxArea=W*H*0.25; /* ignore if >25% of image */
+  return blobs.filter(function(b){return b.area<maxArea;}).slice(0,4);
 }
 
-/* Text: high edge density */
+/* ── Text/Caption: horizontal bands with high contrast edges, NOT full-height ── */
 function detectTxt(px,W,H){
+  /* Step 1: compute per-pixel edge magnitude */
   var edge=new Float32Array(W*H);
   for(var y=1;y<H-1;y++){
     for(var x=1;x<W-1;x++){
       var i=(y*W+x)*4;
-      var lC=(px[i]+px[i+1]+px[i+2])/3;
-      var lR=(px[i+4]+px[i+5]+px[i+6])/3;
-      var lD=(px[(y+1)*W*4+x*4]+px[(y+1)*W*4+x*4+1]+px[(y+1)*W*4+x*4+2])/3;
-      edge[y*W+x]=Math.abs(lC-lR)+Math.abs(lC-lD);
+      var lC=lum(px,i);
+      var lR=lum(px,i+4);
+      var lD=lum(px,((y+1)*W+x)*4);
+      var lU=lum(px,((y-1)*W+x)*4);
+      edge[y*W+x]=Math.max(Math.abs(lC-lR),Math.abs(lC-lD),Math.abs(lC-lU));
     }
   }
-  var GS=8,GW=Math.floor(W/GS),GH=Math.floor(H/GS);
+
+  /* Step 2: row-based approach — text appears as horizontal lines */
+  var GS=6,GW=Math.floor(W/GS),GH=Math.floor(H/GS);
   var sc=new Float32Array(GW*GH);
   for(var gy=0;gy<GH;gy++){
     for(var gx=0;gx<GW;gx++){
-      var sum=0,cnt=0;
-      for(var dy=0;dy<GS;dy++)for(var dx=0;dx<GS;dx++){
-        var pi=(gy*GS+dy)*W+(gx*GS+dx);
-        if(pi<edge.length){sum+=edge[pi];cnt++;}
+      var eSum=0,cnt=0,darkOnLight=0;
+      for(var dy=0;dy<GS;dy++){
+        for(var dx=0;dx<GS;dx++){
+          var py2=gy*GS+dy,px2=gx*GS+dx;
+          var pi=py2*W+px2;
+          if(pi>=edge.length)continue;
+          eSum+=edge[pi];
+          /* Text chars: dark pixel surrounded by light OR light on dark */
+          var ii=pi*4;
+          if(ii+3<px.length){
+            var l=lum(px,ii);
+            if(l<60)darkOnLight+=1;   /* dark text */
+            else if(l>200)darkOnLight+=0.8; /* light/white text */
+          }
+          cnt++;
+        }
       }
-      sc[gy*GW+gx]=cnt?(sum/cnt)/200:0;
+      /* High edge density + presence of dark/light pixels = text */
+      var edgeScore=cnt?(eSum/cnt)/120:0;
+      var charScore=cnt?darkOnLight/cnt:0;
+      sc[gy*GW+gx]=Math.min(1,(edgeScore*0.5+charScore*0.5));
     }
   }
-  return blobEx(sc,GW,GH,GS,0.18).slice(0,4);
+
+  var blobs=blobEx(sc,GW,GH,GS,0.22);
+  /* Text blobs: wide (width > height*1.5) and not too large */
+  var maxArea=W*H*0.30;
+  var good=blobs.filter(function(b){
+    return b.area<maxArea && b.w>GS*2;
+  });
+  return good.slice(0,5);
 }
 
-/* Logo: high saturation regions */
+/* ── Logo: compact high-saturation cluster, small area ── */
 function detectLogo(px,W,H){
-  var GS=10,GW=Math.floor(W/GS),GH=Math.floor(H/GS);
+  var GS=8,GW=Math.floor(W/GS),GH=Math.floor(H/GS);
   var sc=new Float32Array(GW*GH);
   for(var gy=0;gy<GH;gy++){
     for(var gx=0;gx<GW;gx++){
@@ -712,55 +752,60 @@ function detectLogo(px,W,H){
         for(var dx=0;dx<GS;dx++){
           var ix=((gy*GS+dy)*W+(gx*GS+dx))*4;
           if(ix+3>=px.length)continue;
-          var r=px[ix],g=px[ix+1],b=px[ix+2];
-          var mx=Math.max(r,g,b);
-          satSum+=mx>20?(mx-Math.min(r,g,b))/mx:0;
-          cnt++;
+          satSum+=sat(px,ix);cnt++;
         }
       }
       sc[gy*GW+gx]=cnt?satSum/cnt:0;
     }
   }
-  return blobEx(sc,GW,GH,GS,0.28).slice(0,2);
+  var blobs=blobEx(sc,GW,GH,GS,0.32);
+  /* Logos: small and compact */
+  var maxArea=W*H*0.15;
+  return blobs.filter(function(b){return b.area<maxArea;}).slice(0,2);
 }
 
-/* Object: differs from background corners */
+/* ── Object/Person: largest foreground blob vs background ── */
 function detectObj(px,W,H){
-  function cornerAvg(cx,cy){
-    var r=0,g=0,b=0,n=0;
-    for(var dy=0;dy<15&&cy+dy<H;dy++){
-      for(var dx=0;dx<15&&cx+dx<W;dx++){
-        var ix=((cy+dy)*W+(cx+dx))*4;
-        r+=px[ix];g+=px[ix+1];b+=px[ix+2];n++;
-      }
-    }
-    return n?[r/n,g/n,b/n]:[0,0,0];
+  /* Sample background from edges of image (not just corners) */
+  var bgSamples=[];
+  var step=Math.floor(W/20);
+  for(var x=0;x<W;x+=step){
+    bgSamples.push(x*4); /* top row */
+    bgSamples.push(((H-1)*W+x)*4); /* bottom row */
   }
-  var corners=[cornerAvg(0,0),cornerAvg(W-15,0),cornerAvg(0,H-15),cornerAvg(W-15,H-15)];
-  var bgR=0,bgG=0,bgB=0;
-  for(var c=0;c<corners.length;c++){bgR+=corners[c][0];bgG+=corners[c][1];bgB+=corners[c][2];}
-  bgR/=4;bgG/=4;bgB/=4;
+  step=Math.floor(H/20);
+  for(var y2=0;y2<H;y2+=step){
+    bgSamples.push((y2*W)*4); /* left col */
+    bgSamples.push((y2*W+(W-1))*4); /* right col */
+  }
+  var bgR=0,bgG=0,bgB=0,bn=0;
+  for(var s=0;s<bgSamples.length;s++){
+    var bi=bgSamples[s];
+    if(bi+2<px.length){bgR+=px[bi];bgG+=px[bi+1];bgB+=px[bi+2];bn++;}
+  }
+  if(bn){bgR/=bn;bgG/=bn;bgB/=bn;}
 
-  var GS=12,GW=Math.floor(W/GS),GH=Math.floor(H/GS);
+  var GS=10,GW=Math.floor(W/GS),GH=Math.floor(H/GS);
   var sc=new Float32Array(GW*GH);
   for(var gy=0;gy<GH;gy++){
     for(var gx=0;gx<GW;gx++){
-      var sum=0,cnt=0;
+      var diff=0,cnt=0;
       for(var dy=0;dy<GS;dy++){
         for(var dx=0;dx<GS;dx++){
           var ix=((gy*GS+dy)*W+(gx*GS+dx))*4;
           if(ix+3>=px.length)continue;
           var d=(Math.abs(px[ix]-bgR)+Math.abs(px[ix+1]-bgG)+Math.abs(px[ix+2]-bgB))/3;
-          sum+=d;cnt++;
+          diff+=d;cnt++;
         }
       }
-      sc[gy*GW+gx]=cnt?Math.min(1,(sum/cnt)/60):0;
+      sc[gy*GW+gx]=cnt?Math.min(1,(diff/cnt)/50):0;
     }
   }
-  return blobEx(sc,GW,GH,GS,0.42).slice(0,2);
+  /* Return top 2 largest blobs */
+  return blobEx(sc,GW,GH,GS,0.38).slice(0,2);
 }
 
-/* Blob extractor */
+/* ── Blob extractor with min-size filter ── */
 function blobEx(scores,GW,GH,GS,thresh){
   var visited=new Uint8Array(GW*GH);
   var blobs=[];
@@ -779,17 +824,19 @@ function blobEx(scores,GW,GH,GS,thresh){
         var nx2=cx+nb[ni][0],ny2=cy+nb[ni][1];
         if(nx2<0||nx2>=GW||ny2<0||ny2>=GH)continue;
         var idx=ny2*GW+nx2;
-        if(!visited[idx]&&scores[idx]>thresh*0.6){visited[idx]=1;queue.push(idx);}
+        if(!visited[idx]&&scores[idx]>thresh*0.55){visited[idx]=1;queue.push(idx);}
       }
     }
     var bw=(mxX-mnX+1)*GS,bh=(mxY-mnY+1)*GS;
-    if(bw<GS*2||bh<GS)continue;
+    if(bw<GS*1.5||bh<GS)continue;
     blobs.push({x:mnX*GS,y:mnY*GS,w:bw,h:bh,area:bw*bh});
   }
   return blobs.sort(function(a,b){return b.area-a.area;});
 }
 
-/* REMOVE */
+/* ══════════════════════════════════════════
+   REMOVE — smart inpainting with fallback
+══════════════════════════════════════════ */
 function doRemove(){
   if(!hasMask){toast('Pehle paint karo!','w');return;}
   if(!cvReady){
@@ -797,61 +844,105 @@ function doRemove(){
     var btn=document.getElementById('rb');
     btn.textContent='⏳ Loading...';
     var waitIv=setInterval(function(){
-      if(cvReady){
-        clearInterval(waitIv);
-        btn.textContent='✦ Remove';
-        doRemove();
-      }
+      if(cvReady){clearInterval(waitIv);btn.textContent='✦ Remove';doRemove();}
     },300);
-    /* Timeout after 15s */
-    setTimeout(function(){clearInterval(waitIv);btn.textContent='✦ Remove';},15000);
+    setTimeout(function(){clearInterval(waitIv);btn.textContent='✦ Remove';},20000);
     return;
   }
   setProc(true);
+  /* Use setTimeout chain to not freeze UI */
   setTimeout(function(){
     try{
       document.getElementById('ptxt').textContent='Inpainting...';
-      var oc=document.createElement('canvas');
-      oc.width=iW;oc.height=iH;
-      oc.getContext('2d').drawImage(origImg,0,0);
-      var rawMask=maskCv.getContext('2d').getImageData(0,0,iW,iH);
-      var dilated=dilateMask(rawMask,iW,iH,12);
-      var mc2=document.createElement('canvas');
-      mc2.width=iW;mc2.height=iH;
-      mc2.getContext('2d').putImageData(dilated,0,0);
-      var src=cv.imread(oc);
-      var mm=cv.imread(mc2);
-      var gm=new cv.Mat(),bm=new cv.Mat(),dst=new cv.Mat(),dst2=new cv.Mat();
+
+      /* ── Downscale if image is too large (inpaint is slow) ── */
+      var MAX=1200;
+      var scale=Math.min(1,MAX/Math.max(iW,iH));
+      var W2=Math.round(iW*scale),H2=Math.round(iH*scale);
+
+      var srcC=document.createElement('canvas');srcC.width=W2;srcC.height=H2;
+      srcC.getContext('2d').drawImage(origImg,0,0,W2,H2);
+
+      var mskC=document.createElement('canvas');mskC.width=W2;mskC.height=H2;
+      mskC.getContext('2d').drawImage(maskCv,0,0,W2,H2);
+
+      /* ── Dilate mask slightly for cleaner edges ── */
+      var rawMask=mskC.getContext('2d').getImageData(0,0,W2,H2);
+      var dilPx=Math.max(3,Math.round(6*scale));
+      var dilated=dilateMaskFast(rawMask,W2,H2,dilPx);
+      mskC.getContext('2d').putImageData(dilated,0,0);
+
+      /* ── OpenCV inpaint (TELEA only — more stable) ── */
+      var src=cv.imread(srcC);
+      var mm=cv.imread(mskC);
+      var gm=new cv.Mat(),bm=new cv.Mat(),dst=new cv.Mat();
       cv.cvtColor(mm,gm,cv.COLOR_RGBA2GRAY);
-      cv.threshold(gm,bm,30,255,cv.THRESH_BINARY);
-      cv.inpaint(src,bm,dst,iR,cv.INPAINT_TELEA);
-      cv.inpaint(dst,bm,dst2,Math.max(2,Math.floor(iR/2)),cv.INPAINT_NS);
-      var out=document.createElement('canvas');out.width=iW;out.height=iH;
-      cv.imshow(out,dst2);resultUrl=out.toDataURL('image/png');
-      src.delete();mm.delete();gm.delete();bm.delete();dst.delete();dst2.delete();
+      cv.threshold(gm,bm,20,255,cv.THRESH_BINARY);
+
+      /* Radius: proportional to mask size, cap at 25 */
+      var maskArea=bm.countNonZero?bm.countNonZero():1;
+      var rad=Math.min(25,Math.max(5,Math.round(Math.sqrt(maskArea)*0.04)));
+
+      cv.inpaint(src,bm,dst,rad,cv.INPAINT_TELEA);
+
+      /* ── If downscaled, upscale result back ── */
+      var outC=document.createElement('canvas');
+      outC.width=W2;outC.height=H2;
+      cv.imshow(outC,dst);
+
+      src.delete();mm.delete();gm.delete();bm.delete();dst.delete();
+
+      if(scale<1){
+        /* Upscale to original size */
+        var finalC=document.createElement('canvas');finalC.width=iW;finalC.height=iH;
+        var fctx=finalC.getContext('2d');
+        fctx.imageSmoothingEnabled=true;
+        fctx.imageSmoothingQuality='high';
+        fctx.drawImage(outC,0,0,iW,iH);
+        resultUrl=finalC.toDataURL('image/png');
+      }else{
+        resultUrl=outC.toDataURL('image/png');
+      }
+
       showResult();
       toast('✅ Done! Remove ho gaya','s');
-    }catch(err){toast('❌ '+err.message,'e');console.error(err);}
+    }catch(err){
+      toast('❌ Error: '+err.message,'e');
+      console.error(err);
+    }
     setProc(false);
-  },50);
+  },60);
 }
 
-function dilateMask(imgData,W,H,r){
+/* Fast dilation using box approach */
+function dilateMaskFast(imgData,W,H,r){
   var s=imgData.data;
-  var o=new Uint8ClampedArray(W*H*4);
+  /* Step 1: mark mask pixels */
+  var bin=new Uint8Array(W*H);
+  for(var i=0;i<W*H;i++){if(s[i*4]>30)bin[i]=1;}
+  /* Step 2: horizontal pass */
+  var h1=new Uint8Array(W*H);
   for(var y=0;y<H;y++){
     for(var x=0;x<W;x++){
-      var i=(y*W+x)*4;
-      if(s[i]>80){o[i]=o[i+1]=o[i+2]=255;o[i+3]=255;continue;}
       var found=false;
-      outer:for(var dy=-r;dy<=r&&!found;dy++){
-        for(var dx=-r;dx<=r;dx++){
-          var nx=x+dx,ny=y+dy;
-          if(nx<0||nx>=W||ny<0||ny>=H)continue;
-          if(s[(ny*W+nx)*4]>80){found=true;break;}
-        }
+      for(var dx=-r;dx<=r&&!found;dx++){
+        var nx=x+dx;
+        if(nx>=0&&nx<W&&bin[y*W+nx])found=true;
       }
-      if(found){o[i]=o[i+1]=o[i+2]=255;o[i+3]=255;}else{o[i+3]=0;}
+      if(found)h1[y*W+x]=1;
+    }
+  }
+  /* Step 3: vertical pass */
+  var o=new Uint8ClampedArray(W*H*4);
+  for(var y2=0;y2<H;y2++){
+    for(var x2=0;x2<W;x2++){
+      var found2=false;
+      for(var dy=-r;dy<=r&&!found2;dy++){
+        var ny=y2+dy;
+        if(ny>=0&&ny<H&&h1[ny*W+x2])found2=true;
+      }
+      var oi=(y2*W+x2)*4;
+      if(found2){o[oi]=o[oi+1]=o[oi+2]=255;o[oi+3]=255;}
     }
   }
   return new ImageData(o,W,H);
