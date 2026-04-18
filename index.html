@@ -834,7 +834,7 @@ function blobEx(scores,GW,GH,GS,thresh){
 }
 
 /* ══════════════════════════════════════════
-   REMOVE — smart inpainting with fallback
+   REMOVE — robust inpainting
 ══════════════════════════════════════════ */
 function doRemove(){
   if(!hasMask){toast('Pehle paint karo!','w');return;}
@@ -849,66 +849,80 @@ function doRemove(){
     return;
   }
   setProc(true);
-  /* Use setTimeout chain to not freeze UI */
   setTimeout(function(){
+    var mats=[];
+    function mk(){var m=new cv.Mat();mats.push(m);return m;}
+    function cleanup(){mats.forEach(function(m){try{m.delete();}catch(e){}});}
     try{
-      document.getElementById('ptxt').textContent='Inpainting...';
+      document.getElementById('ptxt').textContent='Processing...';
 
-      /* ── Downscale if image is too large (inpaint is slow) ── */
-      var MAX=1200;
-      var scale=Math.min(1,MAX/Math.max(iW,iH));
-      var W2=Math.round(iW*scale),H2=Math.round(iH*scale);
+      /* Downscale large images — inpaint is O(n²) */
+      var MAX=900;
+      var sc=Math.min(1,MAX/Math.max(iW,iH));
+      var W2=Math.round(iW*sc),H2=Math.round(iH*sc);
 
-      var srcC=document.createElement('canvas');srcC.width=W2;srcC.height=H2;
-      srcC.getContext('2d').drawImage(origImg,0,0,W2,H2);
+      /* Draw image to temp canvas */
+      var imgC=document.createElement('canvas');imgC.width=W2;imgC.height=H2;
+      imgC.getContext('2d').drawImage(origImg,0,0,W2,H2);
 
+      /* Draw mask to temp canvas */
       var mskC=document.createElement('canvas');mskC.width=W2;mskC.height=H2;
       mskC.getContext('2d').drawImage(maskCv,0,0,W2,H2);
 
-      /* ── Dilate mask slightly for cleaner edges ── */
+      /* Dilate mask */
       var rawMask=mskC.getContext('2d').getImageData(0,0,W2,H2);
-      var dilPx=Math.max(3,Math.round(6*scale));
-      var dilated=dilateMaskFast(rawMask,W2,H2,dilPx);
-      mskC.getContext('2d').putImageData(dilated,0,0);
+      var dil=dilateMaskFast(rawMask,W2,H2,Math.max(4,Math.round(8*sc)));
+      mskC.getContext('2d').putImageData(dil,0,0);
 
-      /* ── OpenCV inpaint (TELEA only — more stable) ── */
-      var src=cv.imread(srcC);
-      var mm=cv.imread(mskC);
-      var gm=new cv.Mat(),bm=new cv.Mat(),dst=new cv.Mat();
-      cv.cvtColor(mm,gm,cv.COLOR_RGBA2GRAY);
-      cv.threshold(gm,bm,20,255,cv.THRESH_BINARY);
+      /* Read RGBA mats */
+      var srcRGBA=cv.imread(imgC);  mats.push(srcRGBA);
+      var mskRGBA=cv.imread(mskC);  mats.push(mskRGBA);
 
-      /* Fixed inpaint radius — safe default */
-      var rad=15;
-      cv.inpaint(src,bm,dst,rad,cv.INPAINT_TELEA);
+      /* Convert image RGBA→BGR (needed for inpaint) */
+      var srcBGR=mk();
+      cv.cvtColor(srcRGBA,srcBGR,cv.COLOR_RGBA2BGR);
 
-      /* ── If downscaled, upscale result back ── */
-      var outC=document.createElement('canvas');
-      outC.width=W2;outC.height=H2;
-      cv.imshow(outC,dst);
+      /* Convert mask RGBA→GRAY then threshold to get binary uint8 mask */
+      var mskGray=mk();
+      cv.cvtColor(mskRGBA,mskGray,cv.COLOR_RGBA2GRAY);
+      var mskBin=mk();
+      cv.threshold(mskGray,mskBin,10,255,cv.THRESH_BINARY);
 
-      src.delete();mm.delete();gm.delete();bm.delete();dst.delete();
+      /* Inpaint */
+      var dst=mk();
+      cv.inpaint(srcBGR,mskBin,dst,15,cv.INPAINT_TELEA);
 
-      if(scale<1){
-        /* Upscale to original size */
-        var finalC=document.createElement('canvas');finalC.width=iW;finalC.height=iH;
-        var fctx=finalC.getContext('2d');
+      /* Convert BGR result back to RGBA for canvas */
+      var dstRGBA=mk();
+      cv.cvtColor(dst,dstRGBA,cv.COLOR_BGR2RGBA);
+
+      /* Write result to canvas */
+      var outC=document.createElement('canvas');outC.width=W2;outC.height=H2;
+      cv.imshow(outC,dstRGBA);
+      cleanup();
+
+      /* Upscale if needed */
+      if(sc<1){
+        var fin=document.createElement('canvas');fin.width=iW;fin.height=iH;
+        var fctx=fin.getContext('2d');
         fctx.imageSmoothingEnabled=true;
         fctx.imageSmoothingQuality='high';
         fctx.drawImage(outC,0,0,iW,iH);
-        resultUrl=finalC.toDataURL('image/png');
+        resultUrl=fin.toDataURL('image/png');
       }else{
         resultUrl=outC.toDataURL('image/png');
       }
 
       showResult();
-      toast('✅ Done! Remove ho gaya','s');
+      toast('✅ Remove ho gaya!','s');
     }catch(err){
-      toast('❌ Error: '+err.message,'e');
-      console.error(err);
+      cleanup();
+      /* Show actual error message for debugging */
+      toast('❌ '+(err.message||String(err)),'e');
+      console.error('doRemove error:',err);
     }
     setProc(false);
-  },60);
+  },80);
 }
 
 /* Fast dilation using box approach */
