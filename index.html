@@ -187,7 +187,36 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;heigh
 </style>
 </head>
 <body>
-<script async src="https://docs.opencv.org/4.x/opencv.js" onload="cvOk()"></script>
+<script>
+/* Load OpenCV with fallback URLs */
+function loadOpenCV(){
+  var urls=[
+    'https://docs.opencv.org/4.9.0/opencv.js',
+    'https://docs.opencv.org/4.8.0/opencv.js',
+    'https://docs.opencv.org/4.x/opencv.js'
+  ];
+  var idx=0;
+  function tryNext(){
+    if(idx>=urls.length){
+      document.getElementById('cv-st').textContent='❌ OpenCV failed';
+      document.getElementById('cv-st').style.color='var(--red)';
+      toast('OpenCV load nahi hua. Page refresh karo','e');
+      return;
+    }
+    var s=document.createElement('script');
+    s.src=urls[idx++];
+    s.async=true;
+    s.onload=function(){cvOk();};
+    s.onerror=function(){
+      toast('OpenCV retry ho raha hai...','w');
+      setTimeout(tryNext,800);
+    };
+    document.head.appendChild(s);
+  }
+  tryNext();
+}
+window.addEventListener('load',function(){setTimeout(loadOpenCV,100);});
+</script>
 <div id="t"></div>
 
 <!-- HEADER -->
@@ -340,7 +369,7 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;heigh
   <span><span class="dot" style="background:var(--pur)"></span>AI</span>
   <span><span class="dot" style="background:var(--grn)"></span>Remove</span>
   <span id="isz"></span>
-  <span id="cv-st" style="color:var(--warn)">⏳ OpenCV...</span>
+  <span id="cv-st" style="color:var(--warn)">⏳ OpenCV load ho raha hai...</span>
 </div>
 
 <script>
@@ -365,6 +394,9 @@ function cvOk(){
   cvReady=true;
   const el=document.getElementById('cv-st');
   el.textContent='✅ Ready';el.style.color='var(--grn)';
+  /* Update hint text if mask already exists */
+  if(hasMask)setMS(true);
+  toast('✅ OpenCV ready! Ab remove kar sakte ho','s');
 }
 
 /* TOAST */
@@ -525,9 +557,10 @@ function clrMask(){
 }
 function setMS(has){
   hasMask=has;
+  /* Always enable Remove if mask exists — it will wait for OpenCV internally */
   document.getElementById('rb').disabled=!has;
   document.getElementById('hn').textContent=has
-    ?(!cvReady?'⏳ OpenCV load ho raha hai...':'✦ Remove dabao!')
+    ?(!cvReady?'⏳ OpenCV load ho raha hai — Remove dabao, wait karega!':'✦ Remove dabao!')
     :'Paint karo ya Auto-Detect use karo';
 }
 
@@ -564,8 +597,14 @@ function setSz(s){
 ══════════════════════════════════════════ */
 function runAI(){
   if(!origImg){toast('Pehle image load karo!','w');return;}
-  if(!cvReady){toast('OpenCV thoda aur load ho raha hai...','w');return;}
-  var btn=document.getElementById('ai-btn');
+  if(!cvReady){
+    toast('⏳ OpenCV load ho raha hai, thoda ruko...','w');
+    var waitAI=setInterval(function(){
+      if(cvReady){clearInterval(waitAI);runAI();}
+    },400);
+    setTimeout(function(){clearInterval(waitAI);},15000);
+    return;
+  }  var btn=document.getElementById('ai-btn');
   btn.disabled=true;
   toast('🔍 Detect ho raha hai...','i');
 
@@ -753,7 +792,21 @@ function blobEx(scores,GW,GH,GS,thresh){
 /* REMOVE */
 function doRemove(){
   if(!hasMask){toast('Pehle paint karo!','w');return;}
-  if(!cvReady){toast('OpenCV ready nahi hai...','w');return;}
+  if(!cvReady){
+    toast('⏳ OpenCV load ho raha hai, thoda ruko...','w');
+    var btn=document.getElementById('rb');
+    btn.textContent='⏳ Loading...';
+    var waitIv=setInterval(function(){
+      if(cvReady){
+        clearInterval(waitIv);
+        btn.textContent='✦ Remove';
+        doRemove();
+      }
+    },300);
+    /* Timeout after 15s */
+    setTimeout(function(){clearInterval(waitIv);btn.textContent='✦ Remove';},15000);
+    return;
+  }
   setProc(true);
   setTimeout(function(){
     try{
