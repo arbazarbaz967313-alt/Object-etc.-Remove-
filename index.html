@@ -665,109 +665,105 @@ input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:17px;heigh
 </div>
 
 <script>
-/* ══════════════════════════
-   WALLET SYSTEM
-   Storage: localStorage (em_wallet_key, em_wallet_data)
-   In real integration: replace localStorage with Firebase RTD calls
-══════════════════════════ */
+/* ══════════════════════════════════════════
+   WALLET SYSTEM — Real Backend API
+   Backend: https://your-app.onrender.com
+   ⚠️ Sirf ye ek line change karo apne URL se:
+══════════════════════════════════════════ */
+var BACKEND_URL = 'https://YOUR-APP-NAME.onrender.com'; // ← APNA RENDER URL YAHAN DAALO
 
-var WALLET_KEY_STORAGE = 'em_api_key';
-var WALLET_DATA_STORAGE = 'em_wallet_db'; // In prod: Firebase RTD
+var currentKey = null;
+var cachedWallet = null; // last fetched wallet data
 
-/* 
-  Wallet DB format (stored in localStorage, in prod use Firebase):
-  {
-    "EM-abc123": {
-      balance: 450,
-      totalAdded: 500,
-      usedTotal: 50,
-      todayUsed: 3,
-      todayDate: "2025-04-18",
-      history: [
-        { type: "add", amount: 500, note: "Initial topup $5", time: 1713000000000 },
-        { type: "use", amount: -1, note: "Watermark removed", time: 1713000001000 }
-      ]
-    }
-  }
-*/
-
-var currentKey = null; // Active API key
-var walletDb = {}; // In-memory wallet DB
-
-function loadWalletDb(){
-  try{ walletDb = JSON.parse(localStorage.getItem(WALLET_DATA_STORAGE)||'{}'); }
-  catch(e){ walletDb = {}; }
+/* ── API helpers ── */
+async function apiGet(path){
+  try{
+    var res = await fetch(BACKEND_URL+path,{
+      headers:{'Authorization':'Bearer '+currentKey}
+    });
+    return await res.json();
+  }catch(e){ return {success:false,error:'Network error'}; }
 }
-function saveWalletDb(){
-  localStorage.setItem(WALLET_DATA_STORAGE, JSON.stringify(walletDb));
+async function apiPost(path,body){
+  try{
+    var res = await fetch(BACKEND_URL+path,{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+currentKey},
+      body:JSON.stringify(body)
+    });
+    return await res.json();
+  }catch(e){ return {success:false,error:'Network error'}; }
 }
 
-function getWallet(key){
-  return walletDb[key] || null;
-}
-
-function getBalance(key){
-  var w = getWallet(key);
-  return w ? w.balance : 0;
-}
-
-/* Check if balance > 0 before doing an operation */
-function checkBalance(){
-  if(!currentKey) return false;
-  return getBalance(currentKey) > 0;
-}
-
-/* Deduct 1 credit after successful remove */
-function deductCredit(note){
-  if(!currentKey) return;
-  var w = getWallet(currentKey);
-  if(!w) return;
-  if(w.balance <= 0) return;
-  w.balance = Math.max(0, w.balance - 1);
-  w.usedTotal = (w.usedTotal||0) + 1;
-  // Today usage
-  var today = new Date().toISOString().split('T')[0];
-  if(w.todayDate !== today){ w.todayDate = today; w.todayUsed = 0; }
-  w.todayUsed = (w.todayUsed||0) + 1;
-  // History
-  w.history = w.history || [];
-  w.history.unshift({ type:'use', amount:-1, note: note||'API call', time: Date.now() });
-  if(w.history.length > 50) w.history = w.history.slice(0, 50);
-  saveWalletDb();
-  updateHdBadge();
-  // If drawer is open, refresh
-  if(document.getElementById('wallet-panel').classList.contains('open')) renderDashboard();
-}
-
-/* Connect API key */
-function connectKey(){
+/* ── Connect key → verify with backend ── */
+async function connectKey(){
   var inp = document.getElementById('setup-key-inp');
   var key = inp.value.trim();
   if(!key){ showToast('API key enter karo!','warn'); return; }
-  if(!key.startsWith('EM-')){ showToast('Invalid key format. EM-xxxx hona chahiye!','warn'); return; }
-  var w = getWallet(key);
-  if(!w){ showToast('❌ Invalid API key. Admin se verify karo.','error'); return; }
+  if(!key.startsWith('EM-')){ showToast('Invalid format — EM-xxxx chahiye','warn'); return; }
+
+  var btn = document.querySelector('.key-save-btn');
+  btn.textContent='⏳...'; btn.disabled=true;
+
   currentKey = key;
-  localStorage.setItem(WALLET_KEY_STORAGE, key);
-  showToast('✅ Wallet connected! Balance: '+w.balance+' credits','success');
+  var data = await apiGet('/api/wallet');
+
+  if(!data.success){
+    currentKey=null;
+    showToast('❌ '+(data.error||'Invalid key'),'error');
+    btn.textContent='Connect'; btn.disabled=false;
+    return;
+  }
+
+  cachedWallet = data;
+  localStorage.setItem('em_api_key', key);
+  showToast('✅ Connected! Balance: '+data.balance+' credits','success');
+  btn.textContent='Connect'; btn.disabled=false;
   renderWalletState();
   updateHdBadge();
 }
 
+/* ── Fetch fresh wallet from backend ── */
+async function fetchWallet(){
+  if(!currentKey) return null;
+  var data = await apiGet('/api/wallet');
+  if(data.success){ cachedWallet=data; updateHdBadge(); }
+  return data.success ? data : null;
+}
+
+/* ── Check balance (uses cache, fast) ── */
+function checkBalance(){
+  if(!currentKey || !cachedWallet) return false;
+  return (cachedWallet.balance||0) > 0;
+}
+
+/* ── Deduct 1 credit via backend ── */
+async function deductCredit(note){
+  if(!currentKey) return false;
+  var data = await apiPost('/api/wallet/use',{action: note||'watermark_remove'});
+  if(data.success){
+    if(cachedWallet) cachedWallet.balance = data.balance;
+    updateHdBadge();
+    if(document.getElementById('wallet-panel').classList.contains('open')) renderDashboard();
+  }
+  return data.success;
+}
+
+/* ── Logout / disconnect ── */
 function revokeKey(){
-  if(!confirm('Wallet disconnect karein? (Data safe rahega)')) return;
-  currentKey = null;
-  localStorage.removeItem(WALLET_KEY_STORAGE);
+  if(!confirm('Wallet disconnect karein?')) return;
+  currentKey=null; cachedWallet=null;
+  localStorage.removeItem('em_api_key');
   renderWalletState();
   updateHdBadge();
   showToast('Wallet disconnected','info');
 }
 
-/* Render correct wallet state */
+/* ── Decide which state to show ── */
 function renderWalletState(){
   var setup = document.getElementById('w-setup');
-  var dash = document.getElementById('w-dashboard');
-  if(currentKey && getWallet(currentKey)){
+  var dash  = document.getElementById('w-dashboard');
+  if(currentKey && cachedWallet){
     setup.classList.remove('active');
     dash.classList.add('active');
     renderDashboard();
@@ -777,42 +773,38 @@ function renderWalletState(){
   }
 }
 
+/* ── Render dashboard from cachedWallet ── */
 function renderDashboard(){
-  if(!currentKey) return;
-  var w = getWallet(currentKey);
+  var w = cachedWallet;
   if(!w) return;
   var bal = w.balance||0;
-  
-  // Balance display
+
   var balEl = document.getElementById('bal-display');
   balEl.textContent = bal;
   balEl.className = 'bal-amount '+(bal<=0?'bal-empty':bal<=50?'bal-low':'bal-ok');
-  
-  // Status dot+text
+
   var dot = document.getElementById('bsb-dot');
   var txt = document.getElementById('bsb-text');
   if(bal<=0){
-    dot.className='bsb-dot empty'; txt.className='bsb-text empty'; txt.textContent='Balance khatam — API calls blocked';
+    dot.className='bsb-dot empty'; txt.className='bsb-text empty';
+    txt.textContent='Balance khatam — topup karo!';
     document.getElementById('empty-warn').style.display='flex';
   } else if(bal<=50){
-    dot.className='bsb-dot low'; txt.className='bsb-text low'; txt.textContent='Low balance — Jaldi topup karo!';
+    dot.className='bsb-dot low'; txt.className='bsb-text low';
+    txt.textContent='Low balance — jaldi topup karo!';
     document.getElementById('empty-warn').style.display='none';
   } else {
-    dot.className='bsb-dot ok'; txt.className='bsb-text ok'; txt.textContent='Active — API calls chal rahi hain ✓';
+    dot.className='bsb-dot ok'; txt.className='bsb-text ok';
+    txt.textContent='Active — API calls chal rahi hain ✓';
     document.getElementById('empty-warn').style.display='none';
   }
-  
-  // Stats
-  var today = new Date().toISOString().split('T')[0];
-  document.getElementById('stat-used').textContent = w.usedTotal||0;
-  document.getElementById('stat-today').textContent = (w.todayDate===today ? w.todayUsed||0 : 0);
+
+  document.getElementById('stat-used').textContent  = w.usedTotal||0;
+  document.getElementById('stat-today').textContent = w.todayUsed||0;
   document.getElementById('stat-total').textContent = w.totalAdded||0;
-  
-  // Key display (masked)
-  var masked = currentKey.substring(0,6)+'••••••••••'+currentKey.slice(-4);
-  document.getElementById('kdc-key-display').textContent = masked;
-  
-  // History
+  document.getElementById('kdc-key-display').textContent =
+    currentKey.substring(0,6)+'••••••••••'+currentKey.slice(-4);
+
   renderHistory(w.history||[]);
 }
 
@@ -821,33 +813,31 @@ function renderHistory(hist){
   if(!hist.length){ el.innerHTML='<div class="hist-empty">Koi transactions nahi abhi tak</div>'; return; }
   el.innerHTML = hist.slice(0,20).map(function(h){
     var d = new Date(h.time);
-    var timeStr = d.toLocaleDateString('en-IN',{day:'2-digit',month:'short'})+' '+d.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:true});
+    var t = d.toLocaleDateString('en-IN',{day:'2-digit',month:'short'})+' '
+           +d.toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',hour12:true});
     return '<div class="hist-item">'
       +'<div class="hi-icon '+(h.type==='add'?'add':'use')+'">'+(h.type==='add'?'💰':'⚡')+'</div>'
-      +'<div class="hi-info"><div class="hi-name">'+h.note+'</div><div class="hi-time">'+timeStr+'</div></div>'
+      +'<div class="hi-info"><div class="hi-name">'+h.note+'</div><div class="hi-time">'+t+'</div></div>'
       +'<div class="hi-amt '+(h.amount>0?'pos':'neg')+'">'+(h.amount>0?'+':'')+h.amount+'</div>'
       +'</div>';
   }).join('');
 }
 
-/* Header badge */
+/* ── Header balance badge ── */
 function updateHdBadge(){
   var badge = document.getElementById('wallet-hd-badge');
-  var txt = document.getElementById('hd-bal-text');
-  if(!currentKey || !getWallet(currentKey)){
-    badge.classList.remove('show');
-    return;
-  }
-  var bal = getBalance(currentKey);
+  var txt   = document.getElementById('hd-bal-text');
+  if(!currentKey||!cachedWallet){ badge.classList.remove('show'); return; }
+  var bal = cachedWallet.balance||0;
   badge.classList.add('show');
   txt.textContent = bal+' cr';
-  badge.className = 'wallet-hd-badge show '+(bal<=0?'empty':bal<=50?'low':'');
-  // Fix ID
-  badge.id = 'wallet-hd-badge';
+  badge.id='wallet-hd-badge';
+  badge.className='wallet-hd-badge show '+(bal<=0?'empty':bal<=50?'low':'');
 }
 
-/* Wallet panel open/close */
+/* ── Open / close wallet drawer ── */
 function openWallet(){
+  if(currentKey && cachedWallet) fetchWallet().then(renderDashboard);
   renderWalletState();
   document.getElementById('wallet-panel').classList.add('open');
   document.getElementById('wallet-btn').classList.add('active-btn');
@@ -1075,22 +1065,20 @@ function detectLogo(p,W,H){var GS=8,GW=Math.floor(W/GS),GH=Math.floor(H/GS),sc=n
 function detectObj(p,W,H){var bg=[],st=Math.floor(W/20)||1;for(var x=0;x<W;x+=st){bg.push(x*4);bg.push(((H-1)*W+x)*4);}st=Math.floor(H/20)||1;for(var y2=0;y2<H;y2+=st){bg.push((y2*W)*4);bg.push((y2*W+(W-1))*4);}var bR=0,bG=0,bB=0,bn=0;for(var s=0;s<bg.length;s++){var bi=bg[s];if(bi+2<p.length){bR+=p[bi];bG+=p[bi+1];bB+=p[bi+2];bn++;}}if(bn){bR/=bn;bG/=bn;bB/=bn;}var GS=10,GW=Math.floor(W/GS),GH=Math.floor(H/GS),sc=new Float32Array(GW*GH);for(var gy=0;gy<GH;gy++)for(var gx=0;gx<GW;gx++){var d=0,c=0;for(var dy=0;dy<GS;dy++)for(var dx=0;dx<GS;dx++){var ix=((gy*GS+dy)*W+(gx*GS+dx))*4;if(ix+3>=p.length)continue;d+=(Math.abs(p[ix]-bR)+Math.abs(p[ix+1]-bG)+Math.abs(p[ix+2]-bB))/3;c++;}sc[gy*GW+gx]=c?Math.min(1,(d/c)/50):0;}return blobEx(sc,GW,GH,GS,0.38).slice(0,2);}
 function blobEx(scores,GW,GH,GS,thresh){var vis=new Uint8Array(GW*GH),blobs=[];for(var i=0;i<scores.length;i++){if(scores[i]<thresh||vis[i])continue;var q=[i];vis[i]=1;var mnX=i%GW,mxX=mnX,mnY=Math.floor(i/GW),mxY=mnY,qi=0;while(qi<q.length){var cur=q[qi++],cx=cur%GW,cy=Math.floor(cur/GW);if(cx<mnX)mnX=cx;if(cx>mxX)mxX=cx;if(cy<mnY)mnY=cy;if(cy>mxY)mxY=cy;[[1,0],[-1,0],[0,1],[0,-1]].forEach(function(n){var nx=cx+n[0],ny=cy+n[1];if(nx<0||nx>=GW||ny<0||ny>=GH)return;var idx=ny*GW+nx;if(!vis[idx]&&scores[idx]>thresh*0.55){vis[idx]=1;q.push(idx);}});}var bw=(mxX-mnX+1)*GS,bh=(mxY-mnY+1)*GS;if(bw<GS*1.5||bh<GS)continue;blobs.push({x:mnX*GS,y:mnY*GS,w:bw,h:bh,area:bw*bh});}return blobs.sort(function(a,b){return b.area-a.area;});}
 
-/* ══ REMOVE (with wallet check) ══ */
-function doRemove(){
+/* ══ REMOVE (with real wallet check) ══ */
+async function doRemove(){
   if(!hasMask){showToast('Pehle paint karo!','warn');return;}
-  
+
   // ★ WALLET CHECK ★
-  if(!checkBalance()){
-    if(!currentKey){
-      showToast('⚠️ API key nahi hai — Wallet mein connect karo','warn');
-      setTimeout(openWallet, 600);
-    } else {
-      showToast('❌ Balance khatam! Topup karo','error');
-      setTimeout(openWallet, 600);
-    }
-    return;
+  if(!currentKey){
+    showToast('⚠️ Pehle API key connect karo','warn');
+    setTimeout(openWallet,600); return;
   }
-  
+  if(!checkBalance()){
+    showToast('❌ Balance khatam! Topup karo','error');
+    setTimeout(openWallet,600); return;
+  }
+
   if(!cvReady){
     showToast('⏳ OpenCV load ho raha...','warn');
     var btn=document.getElementById('rm-btn');btn.textContent='⏳ Wait...';
@@ -1128,7 +1116,8 @@ function doRemove(){
       // ★ Deduct credit on success ★
       deductCredit('Watermark removed · '+curMode+' mode');
       
-      showResult();showToast('✅ Done! 1 credit used. Balance: '+getBalance(currentKey),'success');
+      deductCredit(curMode+' remove');
+      showResult();showToast('✅ Done! 1 credit used.','success');
     }catch(err){cleanup();showToast('❌ '+(err.message||String(err)),'error');console.error(err);}
     setProc(false);
   },80);
@@ -1148,11 +1137,21 @@ function dlImg(){if(!resultUrl)return;var a=document.createElement('a');a.href=r
 function setProc(on){document.getElementById('proc-ov').classList.toggle('on',on);document.getElementById('rm-btn').disabled=on;}
 
 /* ══ INIT ══ */
-loadWalletDb();
-// Restore saved key
-var savedKey = localStorage.getItem(WALLET_KEY_STORAGE);
-if(savedKey && getWallet(savedKey)){ currentKey = savedKey; }
-updateHdBadge();
+// Restore saved API key and verify with backend
+(async function(){
+  var savedKey = localStorage.getItem('em_api_key');
+  if(savedKey){
+    currentKey = savedKey;
+    var data = await apiGet('/api/wallet');
+    if(data.success){
+      cachedWallet = data;
+    } else {
+      currentKey = null;
+      localStorage.removeItem('em_api_key');
+    }
+    updateHdBadge();
+  }
+})();
 drawQR('qr-canvas', 130);
 drawQR('qr2-canvas', 80);
 showSc('home');
